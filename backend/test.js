@@ -209,7 +209,7 @@ test('GET /health returns 200 ok', async (t) => {
 
   const res = await request(base, { path: '/health' });
   assert.strictEqual(res.status, 200);
-  assert.deepStrictEqual(res.json, { ok: true, version: '0.4.0' });
+  assert.deepStrictEqual(res.json, { ok: true, version: '0.4.1' });
 });
 
 test('GET / returns service descriptor', async (t) => {
@@ -329,12 +329,279 @@ test('CLIENT_TOKEN gate: missing header → 401', async (t) => {
   delete require.cache[require.resolve('./server.js')];
 });
 
+// ---------- /deploys management endpoints (list + delete) ----------
+//
+// These routes require a valid Supabase JWT + call Railway GraphQL. We
+// stub global.fetch so the routes get deterministic responses without any
+// network access, then spin up a fresh server instance with SUPABASE_URL
+// set so the routes actually enter the auth path (rather than the 500
+// "auth not configured" branch).
+
+function makeFetchStub({ validUser = null, userServices = [], onDelete = () => true } = {}) {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, opts = {}) => {
+    const u = typeof url === 'string' ? url : url.toString();
+    const method = (opts.method || 'GET').toUpperCase();
+    // Supabase /auth/v1/user → validate JWT
+    if (u.includes('/auth/v1/user')) {
+      const auth = (opts.headers && (opts.headers.Authorization || opts.headers.authorization)) || '';
+      const token = auth.replace(/^Bearer\s+/i, '');
+      if (validUser && token === validUser.token) {
+        return new Response(JSON.stringify({
+          id: validUser.id,
+          email: validUser.email,
+          email_confirmed_at: '2026-01-01T00:00:00Z',
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ error: 'invalid' }), { status: 401 });
+    }
+    // Railway GraphQL
+    if (u.includes('railway') && u.includes('/graphql')) {
+      let body = {};
+      try { body = JSON.parse(opts.body || '{}'); } catch {}
+      const q = body.query || '';
+      // ListServicesWithActivity OR ListDomains — return the user's services
+      if (q.includes('services(first: 500)') && q.includes('serviceInstances')) {
+        const edges = userServices.map((s) => ({
+          node: {
+            id: s.id,
+            name: s.name,
+            createdAt: s.createdAt || '2026-04-14T00:00:00Z',
+            serviceInstances: {
+              edges: [{
+                node: {
+                  environmentId: body.variables?.envId || '00000000-0000-0000-0000-000000000001',
+                  serviceId: s.id,
+                  latestDeployment: { createdAt: s.latestDeployedAt || '2026-04-14T00:00:00Z', status: s.status || 'SUCCESS' },
+                  domains: { serviceDomains: s.domain ? [{ domain: s.domain }] : [] },
+                },
+              }],
+            },
+          },
+        }));
+        return new Response(JSON.stringify({ data: { project: { services: { edges } } } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      // serviceDelete mutation
+      if (q.includes('serviceDelete')) {
+        const id = body.variables?.id || '';
+        const ok = onDelete(id);
+        return new Response(JSON.stringify({ data: { serviceDelete: ok } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      // Default: empty data
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    // Anything else: 500
+    return new Response(JSON.stringify({ error: 'unexpected fetch in test', url: u }), { status: 500 });
+  };
+  return () => { global.fetch = originalFetch; };
+}
+
+function spinFreshServer(extraEnv = {}) {
+  delete require.cache[require.resolve('./server.js')];
+  // Defaults for the deploys tests
+  process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'https://fake.supabase.co';
+  process.env.SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'fake-anon';
+  process.env.CD_TARGET_TOKEN = process.env.CD_TARGET_TOKEN || 'test-target';
+  process.env.CD_TARGET_PROJECT_ID = process.env.CD_TARGET_PROJECT_ID || '00000000-0000-0000-0000-000000000000';
+  process.env.CD_TARGET_ENVIRONMENT_ID = process.env.CD_TARGET_ENVIRONMENT_ID || '00000000-0000-0000-0000-000000000001';
+  process.env.CLIENT_TOKEN = '';
+  Object.assign(process.env, extraEnv);
+  return require('./server.js');
+}
+
+async function listenOnEphemeral(freshMod) {
+  await new Promise((r) => freshMod.server.listen(0, '127.0.0.1', r));
+  const addr = freshMod.server.address();
+  return `http://127.0.0.1:${addr.port}`;
+}
+
+// Helper: compute the expected upsert hash for a given user id so tests can
+// construct ownership-correct service names.
+const nodeCrypto = require('node:crypto');
+function identityHashForTest(userId) {
+  return nodeCrypto.createHash('sha256').update(`u:${userId}`).digest('hex').slice(0, 8);
+}
+
+test('GET /deploys: 401 without Authorization', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const restore = makeFetchStub();
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, { path: '/deploys' });
+  assert.strictEqual(res.status, 401);
+  assert.match(res.json.error, /auth/i);
+});
+
+test('GET /deploys: 401 with bogus Bearer token', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const restore = makeFetchStub({
+    validUser: { id: 'real-user', token: 'real-token', email: 'real@example.com' },
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, {
+    path: '/deploys',
+    headers: { authorization: 'Bearer not-the-right-token' },
+  });
+  assert.strictEqual(res.status, 401);
+});
+
+test('GET /deploys: 200 with empty list for a fresh user', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const userId = '11111111-1111-4111-8111-111111111111';
+  const restore = makeFetchStub({
+    validUser: { id: userId, token: 'good-token', email: 'fresh@example.com' },
+    userServices: [], // no services yet
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, {
+    path: '/deploys',
+    headers: { authorization: 'Bearer good-token' },
+  });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.json.user_email, 'fresh@example.com');
+  assert.strictEqual(res.json.count, 0);
+  assert.deepStrictEqual(res.json.deploys, []);
+});
+
+test('GET /deploys: returns only services owned by the caller', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const ownerId = '22222222-2222-4222-8222-222222222222';
+  const ownerHash = identityHashForTest(ownerId);
+  const strangerHash = identityHashForTest('99999999-9999-4999-8999-999999999999');
+  const restore = makeFetchStub({
+    validUser: { id: ownerId, token: 'owner-token', email: 'owner@example.com' },
+    userServices: [
+      { id: 'svc-a', name: `cd-${ownerHash}-alpha`, domain: 'cd-alpha.up.railway.app', status: 'SUCCESS' },
+      { id: 'svc-b', name: `cd-${ownerHash}-beta`,  domain: 'cd-beta.up.railway.app',  status: 'SUCCESS' },
+      { id: 'svc-c', name: `cd-${strangerHash}-gamma`, domain: 'cd-gamma.up.railway.app', status: 'SUCCESS' },
+      { id: 'svc-d', name: 'unrelated-service', status: 'SUCCESS' }, // doesn't match prefix at all
+    ],
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, {
+    path: '/deploys',
+    headers: { authorization: 'Bearer owner-token' },
+  });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.json.count, 2);
+  const slugs = res.json.deploys.map((d) => d.slug).sort();
+  assert.deepStrictEqual(slugs, ['alpha', 'beta']);
+  assert.ok(res.json.deploys.every((d) => d.service.startsWith(`cd-${ownerHash}-`)));
+});
+
+test('DELETE /deploys/:slug: 404 when no match', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const userId = '33333333-3333-4333-8333-333333333333';
+  const restore = makeFetchStub({
+    validUser: { id: userId, token: 'good', email: 'nothing@example.com' },
+    userServices: [], // nothing to delete
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, {
+    method: 'DELETE',
+    path: '/deploys/ghost',
+    headers: { authorization: 'Bearer good' },
+  });
+  assert.strictEqual(res.status, 404);
+  assert.match(res.json.error, /no deploy/i);
+});
+
+test('DELETE /deploys/:slug: 403 when the slug belongs to another user', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const callerId = '44444444-4444-4444-8444-444444444444';
+  const otherId  = '55555555-5555-4555-8555-555555555555';
+  const otherHash = identityHashForTest(otherId);
+  let deleted = false;
+  const restore = makeFetchStub({
+    validUser: { id: callerId, token: 'caller-token', email: 'caller@example.com' },
+    userServices: [
+      { id: 'svc-x', name: `cd-${otherHash}-secret`, domain: 'cd-secret.up.railway.app' },
+    ],
+    onDelete: () => { deleted = true; return true; },
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  // The attacker tries to delete someone else's deploy by passing the
+  // full service name (since they can't derive the hash from the slug
+  // without knowing the owner's user_id).
+  const res = await request(base, {
+    method: 'DELETE',
+    path: `/deploys/cd-${otherHash}-secret`,
+    headers: { authorization: 'Bearer caller-token' },
+  });
+  assert.strictEqual(res.status, 403);
+  assert.strictEqual(deleted, false, 'must NOT call serviceDelete on a service the user does not own');
+});
+
+test('DELETE /deploys/:slug: 200 on happy path', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const userId = '66666666-6666-4666-8666-666666666666';
+  const userHash = identityHashForTest(userId);
+  const deletedIds = [];
+  const restore = makeFetchStub({
+    validUser: { id: userId, token: 'owner-token', email: 'owner@example.com' },
+    userServices: [
+      { id: 'svc-happy', name: `cd-${userHash}-myapp`, domain: 'cd-myapp.up.railway.app' },
+    ],
+    onDelete: (id) => { deletedIds.push(id); return true; },
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, {
+    method: 'DELETE',
+    path: '/deploys/myapp',
+    headers: { authorization: 'Bearer owner-token' },
+  });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.json.ok, true);
+  assert.strictEqual(res.json.deleted.slug, 'myapp');
+  assert.deepStrictEqual(deletedIds, ['svc-happy'], 'must call serviceDelete exactly once with the matched service id');
+});
+
+test('DELETE /deploys/: 400 when target is missing', async (t) => {
+  const fresh = spinFreshServer();
+  const base = await listenOnEphemeral(fresh);
+  const userId = '77777777-7777-4777-8777-777777777777';
+  const restore = makeFetchStub({
+    validUser: { id: userId, token: 'good', email: 'empty@example.com' },
+  });
+  t.after(() => { restore(); return new Promise((r) => fresh.server.close(() => r())); });
+
+  const res = await request(base, {
+    method: 'DELETE',
+    path: '/deploys/',
+    headers: { authorization: 'Bearer good' },
+  });
+  assert.strictEqual(res.status, 400);
+});
+
 // Note: the rate-limit test is order-sensitive (it depends on the in-memory
 // bucket state) so we put it last and restart the server before running it.
 test('rate limit: bucket trips after N requests from same ip', async (t) => {
   delete require.cache[require.resolve('./server.js')];
   process.env.RATE_LIMIT_PER_MIN = '2';
   process.env.CLIENT_TOKEN = '';
+  // The /deploys tests above set SUPABASE_URL/SUPABASE_ANON_KEY on process.env
+  // to spin a Supabase-aware server. Unset them so this test goes through the
+  // old CLIENT_TOKEN fallback path and the rate limiter actually fires (rather
+  // than every request being rejected at the auth check with 401).
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_ANON_KEY;
   const freshMod = require('./server.js');
 
   await new Promise((r) => freshMod.server.listen(0, '127.0.0.1', r));

@@ -1282,7 +1282,7 @@ async function handleAuthRoute(req, res, pathname, url, qs) {
 
 // ---------- HTTP server ----------
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const MAINTENANCE_MODE = process.env.CD_MAINTENANCE === '1' || process.env.CD_MAINTENANCE === 'true';
 
 const server = http.createServer(async (req, res) => {

@@ -52,6 +52,37 @@ Pass an optional name hint for the project:
 
 Typical first-deploy latency: **30–60 s** (most of which is the remote build).
 
+## Manage your deploys
+
+### `/deploy --list`
+
+Show every deploy on your account:
+
+```
+/deploy --list
+```
+
+```
+  2 deploys for you@example.com:
+
+  ✓ my-landing    3m ago    https://cd-ff730846-my-landing-production.up.railway.app
+  ✓ api-test      1d ago    https://cd-ff730846-api-test-production.up.railway.app
+
+  Delete with: /deploy --delete <slug>
+```
+
+The list is scoped to your Supabase account — if you sign in on a different machine, you still see the same deploys.
+
+### `/deploy --delete <slug>`
+
+Tear down a deploy by its slug (the trailing part of the URL):
+
+```
+/deploy --delete api-test
+```
+
+Deletes the underlying hosted service and frees up one slot in your daily cap. You can only delete deploys you own — the backend verifies ownership via your Supabase user id before touching anything.
+
 ---
 
 ## Limits (hosted service)
@@ -132,10 +163,11 @@ Operator-side details (which hosting provider is used under the hood, how servic
 - [x] Hosted-backend TTL + daily cap + kill switch (v0.2.0)
 - [x] Email auth via Supabase magic link (v0.3.0)
 - [x] Per-user identity scoping (v0.3.0)
+- [x] Provider-brand sanitizer on all client-visible output (v0.3.1)
+- [x] `/deploy --list` + `/deploy --delete` subcommands (v0.4.0)
 - [ ] Custom domain (no more `.up.railway.app`)
 - [ ] Stream build logs back to the client during the deploy
-- [ ] `/deploy --delete` subcommand to tear down a deployment from CLI
-- [ ] `/deploy --list` to show current deploys for this account
+- [ ] Demo GIF + landing-page style README pitch
 
 ## License
 
