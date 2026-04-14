@@ -359,15 +359,89 @@ async function findServiceByNameGQL(name) {
   return services.find((s) => s.name === name) || null;
 }
 
+// 8-char sha256 hash of the upsert identity — shared between deriveServiceName
+// (which names services) and listUserDeploysGQL (which filters them by owner).
+function identityHash(identity) {
+  return crypto.createHash('sha256').update(String(identity)).digest('hex').slice(0, 8);
+}
+
 // Build a deterministic service name from a client identifier and project
 // slug. Used for upsert: two calls with the same (clientId, projectSlug)
 // produce the same name, so findServiceByNameGQL can reuse the service.
 function deriveServiceName(clientId, projectSlug) {
   const slug = sanitizeName(projectSlug || 'app');
-  const clientHash = crypto.createHash('sha256').update(String(clientId)).digest('hex').slice(0, 8);
+  const clientHash = identityHash(clientId);
   // Leaves room for the prefix + two dashes + 8 hash + slug within Railway's
   // service-name length limit. sanitizeName already caps slug at 24 chars.
   return `${SERVICE_NAME_PREFIX}-${clientHash}-${slug}`;
+}
+
+// Derive the slug portion from a service name — the inverse of
+// deriveServiceName for a known identity. Returns null if the service name
+// doesn't belong to this identity.
+function slugFromServiceName(serviceName, identity) {
+  const prefix = `${SERVICE_NAME_PREFIX}-${identityHash(identity)}-`;
+  if (!serviceName.startsWith(prefix)) return null;
+  return serviceName.slice(prefix.length);
+}
+
+// List every service in the target project whose name matches the given
+// identity's hash prefix. Used by GET /deploys.
+async function listUserDeploysGQL(identity) {
+  const prefix = `${SERVICE_NAME_PREFIX}-${identityHash(identity)}-`;
+  const all = await listServicesWithActivityGQL();
+  const mine = all.filter((s) => s.name && s.name.startsWith(prefix));
+  // Look up each service's domain via getServiceDomainGQL — but that's an
+  // expensive per-service lookup. Instead, read from the list call's own
+  // serviceInstances edge. listServicesWithActivityGQL currently only
+  // returns latestDeployment; augment it with domains in a single pass.
+  const domains = await listAllDomainsGQL();
+  return mine.map((s) => ({
+    service: s.name,
+    slug: slugFromServiceName(s.name, identity),
+    serviceId: s.id,
+    createdAt: s.createdAt,
+    latestDeployedAt: s.latestDeployedAt,
+    latestStatus: s.latestStatus,
+    url: domains.get(s.id) || null,
+  }));
+}
+
+// Helper: one GraphQL call, returns Map<serviceId, 'https://host'>
+async function listAllDomainsGQL() {
+  const data = await railwayGraphQL(
+    `query ListDomains($projectId: String!) {
+       project(id: $projectId) {
+         services(first: 500) {
+           edges { node {
+             id
+             serviceInstances {
+               edges { node {
+                 environmentId
+                 domains { serviceDomains { domain } }
+               } }
+             }
+           } }
+         }
+       }
+     }`,
+    { projectId: CD_TARGET_PROJECT_ID },
+  );
+  const out = new Map();
+  for (const e of data?.project?.services?.edges || []) {
+    const svcId = e?.node?.id;
+    if (!svcId) continue;
+    for (const ie of e.node?.serviceInstances?.edges || []) {
+      const inst = ie?.node;
+      if (!inst || inst.environmentId !== CD_TARGET_ENVIRONMENT_ID) continue;
+      const d = inst.domains?.serviceDomains?.[0]?.domain;
+      if (d) {
+        out.set(svcId, d.startsWith('http') ? d : `https://${d}`);
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 // Transient failures during the `railway up` UPLOAD phase (before any build
@@ -1001,6 +1075,110 @@ function renderAuthPage({ sessionId, secret, backendUrl }) {
 </html>`;
 }
 
+// ---------- /deploys/* routes (list, delete) ----------
+//
+// Both routes require a valid Supabase JWT in Authorization: Bearer <token>.
+// Ownership is enforced by filtering (list) or asserting (delete) that the
+// target service name starts with the authenticated user's identity hash
+// prefix — the same hash used by deriveServiceName for the upsert key.
+
+async function requireAuthUser(req, res) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    jsonResponse(res, 500, { error: 'auth not configured on this backend' });
+    return null;
+  }
+  const token = extractBearerToken(req);
+  if (!token) {
+    jsonResponse(res, 401, { error: 'authentication required' });
+    return null;
+  }
+  try {
+    const user = await validateSupabaseAccessToken(token);
+    if (!user.emailConfirmed) {
+      jsonResponse(res, 403, { error: 'email not verified' });
+      return null;
+    }
+    return user;
+  } catch {
+    jsonResponse(res, 401, { error: 'invalid or expired session' });
+    return null;
+  }
+}
+
+async function handleDeploysRoute(req, res, pathname, qs) {
+  // Kill switch still respected for management ops too (so an operator can
+  // fully pause the backend)
+  if (MAINTENANCE_MODE) {
+    return jsonResponse(res, 503, { error: 'hosted claude-deploy backend is temporarily paused for maintenance' });
+  }
+  if (!CD_TARGET_TOKEN || !CD_TARGET_PROJECT_ID || !CD_TARGET_ENVIRONMENT_ID) {
+    return jsonResponse(res, 500, { error: 'backend misconfigured' });
+  }
+
+  const user = await requireAuthUser(req, res);
+  if (!user) return; // requireAuthUser already sent a response
+  const identity = `u:${user.id}`;
+
+  // GET /deploys — list this user's active deploys
+  if (req.method === 'GET' && pathname === '/deploys') {
+    try {
+      const deploys = await listUserDeploysGQL(identity);
+      // Return minimal, sanitized fields
+      const out = deploys.map((d) => ({
+        slug: d.slug,
+        service: d.service,
+        url: d.url,
+        status: d.latestStatus,
+        created_at: d.createdAt,
+        last_deployed_at: d.latestDeployedAt,
+      }));
+      return jsonResponse(res, 200, { user_email: user.email, count: out.length, deploys: out });
+    } catch (err) {
+      console.error(`[claude-deploy] /deploys list failed:`, err);
+      return jsonResponse(res, 500, { error: 'failed to list deploys', detail: sanitizeForClient((err.message || '').slice(0, 300)) });
+    }
+  }
+
+  // DELETE /deploys/:slug-or-service-name — delete a deploy owned by this user
+  if (req.method === 'DELETE' && pathname.startsWith('/deploys/')) {
+    const rawTarget = decodeURIComponent(pathname.slice('/deploys/'.length)).trim();
+    if (!rawTarget) {
+      return jsonResponse(res, 400, { error: 'missing target: /deploys/<slug-or-service-name>' });
+    }
+    // Accept either the slug ("my-project") or the full service name
+    // ("cd-ab12cd34-my-project"). We look up via findServiceByNameGQL for
+    // both cases.
+    const candidates = [
+      rawTarget,
+      `${SERVICE_NAME_PREFIX}-${identityHash(identity)}-${sanitizeName(rawTarget)}`,
+    ];
+    let match = null;
+    for (const name of candidates) {
+      try {
+        const found = await findServiceByNameGQL(name);
+        if (found) { match = found; break; }
+      } catch {}
+    }
+    if (!match) {
+      return jsonResponse(res, 404, { error: `no deploy found matching "${rawTarget}"` });
+    }
+    // Ownership check: the service name must start with this user's prefix
+    const owned = match.name.startsWith(`${SERVICE_NAME_PREFIX}-${identityHash(identity)}-`);
+    if (!owned) {
+      console.warn(`[claude-deploy] /deploys DELETE denied user=${user.email} tried to delete ${match.name}`);
+      return jsonResponse(res, 403, { error: 'not your deploy' });
+    }
+    const ok = await deleteServiceGQL(match.id);
+    if (!ok) {
+      return jsonResponse(res, 500, { error: 'delete failed' });
+    }
+    console.log(`[claude-deploy] /deploys DELETE user=${user.email} service=${match.name}`);
+    return jsonResponse(res, 200, { ok: true, deleted: { slug: slugFromServiceName(match.name, identity), service: match.name } });
+  }
+
+  return jsonResponse(res, 405, { error: 'method not allowed' });
+}
+
 async function handleAuthRoute(req, res, pathname, url, qs) {
   const backendUrl = publicBackendUrl(req);
 
@@ -1104,7 +1282,7 @@ async function handleAuthRoute(req, res, pathname, url, qs) {
 
 // ---------- HTTP server ----------
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 const MAINTENANCE_MODE = process.env.CD_MAINTENANCE === '1' || process.env.CD_MAINTENANCE === 'true';
 
 const server = http.createServer(async (req, res) => {
@@ -1132,7 +1310,7 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, {
         service: 'claude-deploy',
         version: VERSION,
-        endpoints: ['POST /deploy', 'POST /auth/start', 'GET /auth/check', 'GET /auth/page', 'GET /auth/callback', 'POST /auth/complete', 'GET /health'],
+        endpoints: ['POST /deploy', 'GET /deploys', 'DELETE /deploys/:slug', 'POST /auth/start', 'GET /auth/check', 'GET /auth/page', 'POST /auth/complete', 'GET /health'],
         maintenance: MAINTENANCE_MODE,
         ttl_hours: SERVICE_TTL_HOURS,
         daily_limit_per_user: DAILY_LIMIT_PER_IP, // label change for clarity; env var stays
@@ -1146,6 +1324,11 @@ const server = http.createServer(async (req, res) => {
     // ----- auth flow -----
     if (pathname.startsWith('/auth/')) {
       return await handleAuthRoute(req, res, pathname, url, qs);
+    }
+
+    // ----- deploy management (list / delete) -----
+    if (pathname === '/deploys' || pathname.startsWith('/deploys/')) {
+      return await handleDeploysRoute(req, res, pathname, qs);
     }
 
     if (!(req.method === 'POST' && pathname === '/deploy')) {

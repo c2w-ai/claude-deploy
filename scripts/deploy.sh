@@ -75,6 +75,30 @@ get_or_create_client_id() {
   printf '%s' "$id"
 }
 
+# Subcommand dispatch — --list and --delete skip packaging + upload and just
+# hit the management endpoints on the backend. We still need an auth token
+# for both, so the auth flow runs the same way.
+SUBCOMMAND=""
+SUBCOMMAND_ARG=""
+if [ $# -gt 0 ]; then
+  case "$1" in
+    --list|list)
+      SUBCOMMAND="list"
+      shift
+      ;;
+    --delete|delete)
+      SUBCOMMAND="delete"
+      shift
+      if [ $# -eq 0 ]; then
+        printf '%s\n' "❌ Usage: /deploy --delete <slug>" >&2
+        exit 10
+      fi
+      SUBCOMMAND_ARG="$1"
+      shift
+      ;;
+  esac
+fi
+
 # Default project name = slug of current directory or arg override
 DEFAULT_NAME="$(slugify "$(basename "$PWD")")"
 PROJECT_NAME="${1:-$DEFAULT_NAME}"
@@ -209,6 +233,127 @@ run_auth_flow() {
 AUTH_TOKEN=$(load_cached_auth_token)
 if [ -z "$AUTH_TOKEN" ]; then
   AUTH_TOKEN=$(run_auth_flow)
+fi
+
+# ---------- subcommand: --list ----------
+if [ "$SUBCOMMAND" = "list" ]; then
+  say "📋 Listing your deploys..."
+  HTTP_OUT="$WORK/deploys.json"
+  set +e
+  HTTP_CODE=$(curl -sS -o "$HTTP_OUT" -w '%{http_code}' \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "${BACKEND_URL%/}/deploys")
+  CURL_STATUS=$?
+  set -e
+  if [ $CURL_STATUS -ne 0 ]; then
+    say "❌ curl failed ($CURL_STATUS) reaching $BACKEND_URL"
+    exit 6
+  fi
+  if [ "$HTTP_CODE" = "401" ]; then
+    say "⚠ Session expired — signing you in again."
+    rm -f "$AUTH_TOKEN_FILE"
+    AUTH_TOKEN=$(run_auth_flow)
+    HTTP_CODE=$(curl -sS -o "$HTTP_OUT" -w '%{http_code}' \
+      -H "Authorization: Bearer $AUTH_TOKEN" \
+      "${BACKEND_URL%/}/deploys")
+  fi
+  if [ "$HTTP_CODE" != "200" ]; then
+    say "❌ Backend returned HTTP $HTTP_CODE"
+    cat "$HTTP_OUT" >&2 || true
+    exit 4
+  fi
+  # Emit the raw JSON for Claude Code's /deploy slash command to parse,
+  # then a human table on stderr.
+  cat "$HTTP_OUT"
+  say ""
+  python3 - "$HTTP_OUT" <<'PY' >&2 || true
+import json, sys, time
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+deploys = d.get('deploys', [])
+email = d.get('user_email', '')
+if not deploys:
+    print(f"  No deploys yet for {email}.")
+    print(f"  Run `/deploy` from a project directory to create one.")
+    sys.exit(0)
+
+def ago(iso):
+    if not iso: return '—'
+    from datetime import datetime, timezone
+    try:
+        t = datetime.fromisoformat(iso.replace('Z','+00:00'))
+        secs = (datetime.now(timezone.utc) - t).total_seconds()
+        if secs < 60: return f"{int(secs)}s ago"
+        if secs < 3600: return f"{int(secs/60)}m ago"
+        if secs < 86400: return f"{int(secs/3600)}h ago"
+        return f"{int(secs/86400)}d ago"
+    except Exception:
+        return iso[:10]
+
+print(f"  {len(deploys)} deploy(s) for {email}:")
+print()
+for d in deploys:
+    slug = (d.get('slug') or '?')[:24]
+    url  = d.get('url') or '(no domain)'
+    status = (d.get('status') or '?').lower()
+    last = ago(d.get('last_deployed_at') or d.get('created_at'))
+    mark = '✓' if status in ('success', 'live') else ('⚠' if status in ('failed','crashed') else '•')
+    print(f"  {mark} {slug:<24}  {last:<10}  {url}")
+print()
+print("  Delete with: /deploy --delete <slug>")
+PY
+  exit 0
+fi
+
+# ---------- subcommand: --delete ----------
+if [ "$SUBCOMMAND" = "delete" ]; then
+  if [ -z "$SUBCOMMAND_ARG" ]; then
+    say "❌ Usage: /deploy --delete <slug>"
+    exit 10
+  fi
+  say "🗑  Deleting deploy '$SUBCOMMAND_ARG'..."
+  # URL-encode minimally (slugs are already [a-z0-9-])
+  ESC=$(printf '%s' "$SUBCOMMAND_ARG" | sed 's|[^a-zA-Z0-9._-]|_|g')
+  HTTP_OUT="$WORK/delete.json"
+  set +e
+  HTTP_CODE=$(curl -sS -o "$HTTP_OUT" -w '%{http_code}' -X DELETE \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "${BACKEND_URL%/}/deploys/$ESC")
+  CURL_STATUS=$?
+  set -e
+  if [ $CURL_STATUS -ne 0 ]; then
+    say "❌ curl failed ($CURL_STATUS)"
+    exit 6
+  fi
+  if [ "$HTTP_CODE" = "401" ]; then
+    rm -f "$AUTH_TOKEN_FILE"
+    AUTH_TOKEN=$(run_auth_flow)
+    HTTP_CODE=$(curl -sS -o "$HTTP_OUT" -w '%{http_code}' -X DELETE \
+      -H "Authorization: Bearer $AUTH_TOKEN" \
+      "${BACKEND_URL%/}/deploys/$ESC")
+  fi
+  case "$HTTP_CODE" in
+    200|204)
+      cat "$HTTP_OUT"
+      say ""
+      say "✅ Deleted $SUBCOMMAND_ARG"
+      exit 0
+      ;;
+    404)
+      say "❌ No deploy matching '$SUBCOMMAND_ARG'."
+      say "   Run /deploy --list to see your current deploys."
+      exit 11
+      ;;
+    403)
+      say "❌ That deploy doesn't belong to your account."
+      exit 12
+      ;;
+    *)
+      say "❌ Backend returned HTTP $HTTP_CODE"
+      cat "$HTTP_OUT" >&2 || true
+      exit 4
+      ;;
+  esac
 fi
 
 say "📦 Packaging '$PROJECT_NAME' (slug: $PROJECT_SLUG)..."

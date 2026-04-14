@@ -209,7 +209,7 @@ test('GET /health returns 200 ok', async (t) => {
 
   const res = await request(base, { path: '/health' });
   assert.strictEqual(res.status, 200);
-  assert.deepStrictEqual(res.json, { ok: true, version: '0.3.1' });
+  assert.deepStrictEqual(res.json, { ok: true, version: '0.4.0' });
 });
 
 test('GET / returns service descriptor', async (t) => {
