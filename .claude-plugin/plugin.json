@@ -1,6 +1,6 @@
 {
   "name": "claude-deploy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Deploy the current project to Railway with a single /deploy command and get a public URL back.",
   "author": {
     "name": "c2w-ai"
