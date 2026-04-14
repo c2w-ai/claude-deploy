@@ -81,8 +81,28 @@ railway domain --service api
 
 1. Create a Supabase project at https://supabase.com (or reuse an existing one).
 2. **Enable Email auth**: Authentication → Providers → Email → enabled. Leave "Confirm email" ON (default).
-3. **Add redirect URL allowlist**: Authentication → URL Configuration → Site URL = your backend public URL (e.g. `https://api-production-xxxx.up.railway.app`); add `<backend-url>/auth/callback` to the allowed Redirect URLs list.
-4. Get the project URL + anon key: Project Settings → API. Set those as `SUPABASE_URL` and `SUPABASE_ANON_KEY` on your backend.
+3. **Site URL + Redirect allowlist** — this is the most failure-prone step. The magic-link emails that Supabase sends need to redirect back to your backend's `/auth/page`, so the backend URL must be in the allowlist. Two ways to set it:
+
+   **Option A — via the Dashboard**: Authentication → URL Configuration
+   - Site URL: `https://<your-backend>.up.railway.app` (or your custom domain)
+   - Redirect URLs: add `https://<your-backend>.up.railway.app/**`
+
+   **Option B — via the Management API** (scriptable):
+   ```bash
+   SBP_TOKEN=<your Supabase personal access token, sbp_...>
+   REF=<your project ref>
+   curl -sS -X PATCH "https://api.supabase.com/v1/projects/$REF/config/auth" \
+     -H "Authorization: Bearer $SBP_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "site_url": "https://<your-backend>.up.railway.app",
+       "uri_allow_list": "https://<your-backend>.up.railway.app/**,http://localhost:*/**,http://127.0.0.1:*/**"
+     }'
+   ```
+
+   If the allowlist is empty, clicking the magic link lands on Supabase's default site (localhost:3000) and the CLI will hang waiting forever. If you see users complaining that `/deploy` "never returns" after sign-in, **check this first**.
+
+4. Get the project URL + publishable (anon) key: Project Settings → API. Set those as `SUPABASE_URL` and `SUPABASE_ANON_KEY` on your backend. You do NOT need the service role key for the default flow — the backend's JWT validation uses the public `/auth/v1/user` endpoint which accepts the user's own access token as auth.
 
 ## 6. Point the plugin at your backend
 
