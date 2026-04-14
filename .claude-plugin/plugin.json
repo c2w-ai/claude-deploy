@@ -1,6 +1,6 @@
 {
   "name": "claude-deploy",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Deploy any project to the web with a single /deploy command. Email-authenticated, upsert-aware, zero-signup hosting for Claude Code users.",
   "author": {
     "name": "c2w-ai"

@@ -506,7 +506,7 @@ async function deploy(tarballBuffer, opts) {
       serviceId: service.id,
       isNewService,
       buildMs: up.elapsedMs,
-      logTail: tail(up.stdout + '\n' + up.stderr, 20),
+      logTail: sanitizeForClient(tail(up.stdout + '\n' + up.stderr, 20)),
     };
   } finally {
     if (needsCleanup && service?.id) {
@@ -521,6 +521,43 @@ async function deploy(tarballBuffer, opts) {
 function tail(text, lines) {
   const all = String(text || '').split('\n');
   return all.slice(-lines).join('\n');
+}
+
+// Strip the underlying hosting provider's brand out of strings we're about
+// to return to end users. Internal logs + exception messages frequently
+// leak "Railway", "railpack", "backboard.railway.com", and raw build-log
+// URLs — none of that should be visible in the CLI output. The upstream
+// host domain (*.up.railway.app) on successful deploy URLs is explicitly
+// preserved because the product still uses it for the time being.
+const SANITIZE_PATTERNS = [
+  // Entire "Build Logs" line pointing at provider dashboard — redact
+  [/^\s*Build Logs?:\s*https?:\/\/railway\.com\/[^\n]*\n?/gim, ''],
+  // "[auth] sharing credentials for <registry>" — internal infra noise
+  [/^\s*\[auth\]\s+sharing credentials for [^\n]*\n?/gim, ''],
+  // Any remaining provider URL → redact
+  [/https?:\/\/railway\.com\/[^\s"'<>)]+/g, '(internal build log)'],
+  [/https?:\/\/backboard\.railway\.com\/[^\s"'<>)]+/g, '(internal hosting API)'],
+  // Container registry hostnames
+  [/[a-z0-9-]+\.railway-registry\.com/gi, '(internal registry)'],
+  // GraphQL / API internal names
+  [/Railway GraphQL/g, 'Hosting API'],
+  [/railway\.com\/graphql\/v2/g, 'hosting API'],
+  // Build pipeline naming
+  [/\[railpack\]/g, '[builder]'],
+  [/railpack/g, 'builder'],
+  // Generic "Railway" / "railway" (but NEVER touch .up.railway.app — that's
+  // the actual deploy URL we return to users and is documented as such).
+  [/\bRailway\b(?!\.app)/g, 'hosting platform'],
+  [/(?<!\.)(?<!\w)railway(?!\.app)(?!\w)/gi, 'hosting'],
+];
+
+function sanitizeForClient(text) {
+  if (text === null || text === undefined) return text;
+  let s = String(text);
+  for (const [re, replacement] of SANITIZE_PATTERNS) {
+    s = s.replace(re, replacement);
+  }
+  return s;
 }
 
 // ---------- utilities ----------
@@ -1067,7 +1104,7 @@ async function handleAuthRoute(req, res, pathname, url, qs) {
 
 // ---------- HTTP server ----------
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const MAINTENANCE_MODE = process.env.CD_MAINTENANCE === '1' || process.env.CD_MAINTENANCE === 'true';
 
 const server = http.createServer(async (req, res) => {
@@ -1231,13 +1268,13 @@ const server = http.createServer(async (req, res) => {
     if (isTransientRailwayError(err)) {
       return jsonResponse(res, 503, {
         error: 'Hosting platform is temporarily unavailable. Please try /deploy again in a minute.',
-        detail: (err.message || '').slice(0, 300),
+        detail: sanitizeForClient((err.message || '').slice(0, 300)),
       });
     }
     const status = err.status || 500;
-    const payload = { error: err.message || 'internal error' };
-    if (err.stderr) payload.stderr = tail(err.stderr, 20);
-    if (err.stdout) payload.stdout = tail(err.stdout, 20);
+    const payload = { error: sanitizeForClient(err.message || 'internal error') };
+    if (err.stderr) payload.stderr = sanitizeForClient(tail(err.stderr, 20));
+    if (err.stdout) payload.stdout = sanitizeForClient(tail(err.stdout, 20));
     return jsonResponse(res, status, payload);
   }
 });
@@ -1264,6 +1301,7 @@ module.exports = {
   rateLimited,
   isTransientRailwayError,
   isUploadPhaseError,
+  sanitizeForClient,
   tail,
   // server factory for isolated tests
   _createServerForTest: () => server,

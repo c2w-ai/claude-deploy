@@ -23,7 +23,7 @@ process.env.RATE_LIMIT_PER_MIN = '3';
 process.env.CLIENT_TOKEN = ''; // explicit: no auth by default for most tests
 
 const mod = require('./server.js');
-const { server, sanitizeName, genServiceName, deriveServiceName, tail, isTransientRailwayError, isUploadPhaseError } = mod;
+const { server, sanitizeName, genServiceName, deriveServiceName, sanitizeForClient, tail, isTransientRailwayError, isUploadPhaseError } = mod;
 
 // ---------- in-process HTTP helper ----------
 
@@ -146,6 +146,61 @@ test('isUploadPhaseError: no-retry once build started', () => {
   assert.strictEqual(isUploadPhaseError({ message: 'build failed', stdout: '' }), false);
 });
 
+test('sanitizeForClient: redacts provider build-log URLs entirely', () => {
+  const input = '  Build Logs: https://railway.com/project/abc/service/def?id=xyz\nother stuff\n';
+  const out = sanitizeForClient(input);
+  assert.ok(!out.includes('railway.com'), 'should redact railway.com URLs');
+  assert.ok(!out.includes('Build Logs'), 'should strip the Build Logs line entirely');
+  assert.ok(out.includes('other stuff'), 'should preserve unrelated lines');
+});
+
+test('sanitizeForClient: rewrites [railpack] to [builder]', () => {
+  const out = sanitizeForClient('[railpack] merge $packages:apt');
+  assert.strictEqual(out, '[builder] merge $packages:apt');
+});
+
+test('sanitizeForClient: rewrites "Railway GraphQL" error messages', () => {
+  const out = sanitizeForClient('Railway GraphQL error: invalid mutation');
+  assert.ok(out.startsWith('Hosting API error:'), `got: ${out}`);
+});
+
+test('sanitizeForClient: strips registry auth lines', () => {
+  const input = 'a\n[auth] sharing credentials for production-europe-west4-drams3a.railway-registry.com\nb\n';
+  const out = sanitizeForClient(input);
+  assert.ok(!out.includes('railway-registry'), 'registry hostname leaked');
+  assert.ok(!out.includes('[auth] sharing'), 'auth line leaked');
+  assert.ok(out.includes('a\n'));
+  assert.ok(out.includes('b\n'));
+});
+
+test('sanitizeForClient: PRESERVES .up.railway.app deploy URLs', () => {
+  // This is the one intentional leak — it's the actual URL we hand users.
+  const input = 'Deploy complete\nhttps://cd-myapp-production.up.railway.app is your URL';
+  const out = sanitizeForClient(input);
+  assert.ok(out.includes('.up.railway.app'), 'intentional user-facing URL must not be rewritten');
+  assert.ok(out.includes('cd-myapp-production.up.railway.app'), 'exact subdomain must survive');
+});
+
+test('sanitizeForClient: handles null/undefined', () => {
+  assert.strictEqual(sanitizeForClient(null), null);
+  assert.strictEqual(sanitizeForClient(undefined), undefined);
+  assert.strictEqual(sanitizeForClient(''), '');
+});
+
+test('sanitizeForClient: no Railway mentions survive except the intentional URL', () => {
+  const input = `  Build Logs: https://railway.com/project/foo/service/bar
+CI mode enabled
+[railpack] merge
+[auth] sharing credentials for x.railway-registry.com
+Railway GraphQL error: nope
+Backoff reqwest error: https://backboard.railway.com/graphql/v2
+https://cd-app.up.railway.app`;
+  const out = sanitizeForClient(input);
+  const allMatches = out.match(/railway/gi) || [];
+  assert.strictEqual(allMatches.length, 1, `expected 1 match (the .up.railway.app URL), got ${allMatches.length}: ${out}`);
+  assert.ok(out.includes('cd-app.up.railway.app'));
+});
+
 // ---------- HTTP routing ----------
 
 test('GET /health returns 200 ok', async (t) => {
@@ -154,7 +209,7 @@ test('GET /health returns 200 ok', async (t) => {
 
   const res = await request(base, { path: '/health' });
   assert.strictEqual(res.status, 200);
-  assert.deepStrictEqual(res.json, { ok: true, version: '0.3.0' });
+  assert.deepStrictEqual(res.json, { ok: true, version: '0.3.1' });
 });
 
 test('GET / returns service descriptor', async (t) => {
