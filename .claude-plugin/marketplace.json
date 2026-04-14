@@ -1,0 +1,14 @@
+{
+  "name": "claude-deploy",
+  "owner": {
+    "name": "c2w-ai"
+  },
+  "plugins": [
+    {
+      "name": "claude-deploy",
+      "source": ".",
+      "description": "Deploy the current project to Railway with /deploy and get a public URL back. Upsert-aware, 24h TTL, rate-limited hosted backend.",
+      "version": "0.2.0"
+    }
+  ]
+}

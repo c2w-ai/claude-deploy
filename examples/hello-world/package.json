@@ -1,0 +1,13 @@
+{
+  "name": "claude-deploy-hello-world",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal hello-world app for claude-deploy end-to-end testing.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
