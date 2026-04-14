@@ -1,7 +1,7 @@
 {
   "name": "claude-deploy-backend",
   "version": "0.1.0",
-  "description": "Receives tarballs from the claude-deploy Claude Code plugin and deploys them to Railway.",
+  "description": "Hosted backend for the claude-deploy Claude Code plugin. Receives gzipped tarballs, authenticates users via Supabase, builds + serves them on a public URL.",
   "private": true,
   "main": "server.js",
   "scripts": {

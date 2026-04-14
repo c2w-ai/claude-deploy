@@ -7,8 +7,8 @@
     {
       "name": "claude-deploy",
       "source": "./.",
-      "description": "Deploy the current project to Railway with /deploy and get a public URL back. Upsert-aware, 24h TTL, rate-limited hosted backend.",
-      "version": "0.2.1"
+      "description": "Deploy any project to the web with /deploy — email auth, upsert-aware, 24h TTL, rate-limited hosted service.",
+      "version": "0.3.0"
     }
   ]
 }

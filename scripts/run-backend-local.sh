@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run the claude-deploy backend locally. Needs a Railway project token
-# (CD_TARGET_TOKEN) scoped to the user-apps project + environment.
+# Run the claude-deploy backend locally. Needs a project token
+# (CD_TARGET_TOKEN) for the underlying hosting provider, plus Supabase
+# credentials for authentication. See docs/SELFHOST.md.
 #
 # Usage:  bash scripts/run-backend-local.sh
 # Env:

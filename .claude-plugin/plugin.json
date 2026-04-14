@@ -1,12 +1,12 @@
 {
   "name": "claude-deploy",
-  "version": "0.2.1",
-  "description": "Deploy the current project to Railway with a single /deploy command and get a public URL back.",
+  "version": "0.3.0",
+  "description": "Deploy any project to the web with a single /deploy command. Email-authenticated, upsert-aware, zero-signup hosting for Claude Code users.",
   "author": {
     "name": "c2w-ai"
   },
   "homepage": "https://github.com/c2w-ai/claude-deploy",
   "repository": "https://github.com/c2w-ai/claude-deploy",
   "license": "MIT",
-  "keywords": ["deploy", "railway", "hosting", "publish", "one-command", "upsert"]
+  "keywords": ["deploy", "hosting", "publish", "one-command", "upsert", "auth"]
 }

@@ -53,11 +53,24 @@ const CD_TARGET_PROJECT_ID = process.env.CD_TARGET_PROJECT_ID || '';
 const CD_TARGET_ENVIRONMENT_ID = process.env.CD_TARGET_ENVIRONMENT_ID || '';
 const RAILWAY_GRAPHQL_URL = process.env.RAILWAY_GRAPHQL_URL || 'https://backboard.railway.com/graphql/v2';
 
+// Supabase — used for end-user authentication (email magic link). The
+// backend never sees user passwords; the browser auth page uses the
+// Supabase JS SDK with the anon key to sign up / sign in, then posts the
+// resulting access token back to the backend for session pairing.
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
+// PUBLIC_BACKEND_URL is the externally-reachable URL of THIS backend — needed
+// for Supabase redirect_to after email confirmation. When not set we derive
+// from the incoming request Host header.
+const PUBLIC_BACKEND_URL = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/$/, '');
+
 function warnMissingEnv() {
   const missing = [];
   if (!CD_TARGET_TOKEN) missing.push('CD_TARGET_TOKEN');
   if (!CD_TARGET_PROJECT_ID) missing.push('CD_TARGET_PROJECT_ID');
   if (!CD_TARGET_ENVIRONMENT_ID) missing.push('CD_TARGET_ENVIRONMENT_ID');
+  if (!SUPABASE_URL) missing.push('SUPABASE_URL');
+  if (!SUPABASE_ANON_KEY) missing.push('SUPABASE_ANON_KEY');
   if (missing.length) {
     console.warn(`[claude-deploy] WARNING: missing env vars: ${missing.join(', ')} — deploys will fail.`);
   }
@@ -565,6 +578,142 @@ function checkAuth(req) {
   return scheme === 'Bearer' && token === CLIENT_TOKEN;
 }
 
+// Extract the Bearer token from an Authorization header. Returns null if
+// not present.
+function extractBearerToken(req) {
+  const h = req.headers['authorization'] || '';
+  const [scheme, token] = h.split(' ');
+  if (scheme === 'Bearer' && token) return token.trim();
+  return null;
+}
+
+// ---------- Supabase auth helpers ----------
+//
+// The flow:
+//   1. CLI calls POST /auth/start → backend issues a session_id + session_secret
+//      and returns a verify_url pointing at GET /auth/page?session_id=... .
+//   2. CLI opens the verify_url in the user's browser and starts polling
+//      GET /auth/check?session_id=...&secret=... every ~2s.
+//   3. Browser page uses Supabase JS SDK (anon key) to take email input and
+//      call signInWithOtp({ email, emailRedirectTo: ".../auth/callback?session_id=..." }).
+//      Supabase emails the user a magic link.
+//   4. User clicks the magic link → lands on /auth/callback which serves a
+//      minimal HTML that uses the Supabase JS SDK to exchange the URL-hash
+//      tokens into a session, then POSTs { access_token, refresh_token,
+//      session_id, secret } to /auth/complete.
+//   5. /auth/complete validates the access_token by calling Supabase
+//      /auth/v1/user; on success it records the user_id + access_token in
+//      the in-memory session map.
+//   6. CLI's next /auth/check poll returns { status: "verified", ... }
+//      including the access token. CLI caches it and proceeds.
+//
+// All session state is in-memory. Sessions expire after 10 min of pending
+// or 24h of verified (verified sessions are just a cache — the access token
+// is the real credential).
+
+const AUTH_SESSION_TTL_MS = 10 * 60 * 1000;          // pending timeout
+const AUTH_VERIFIED_TTL_MS = 24 * 60 * 60 * 1000;    // cache timeout
+const authSessions = new Map();
+// Map<session_id, {
+//   secret: string,              // returned to CLI, required on poll
+//   status: 'pending'|'verified'|'expired',
+//   createdAt: ms,
+//   verifiedAt: ms|null,
+//   email: string|null,
+//   userId: string|null,
+//   accessToken: string|null,
+//   refreshToken: string|null,
+// }>
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, sess] of authSessions) {
+    if (sess.status === 'pending' && now - sess.createdAt > AUTH_SESSION_TTL_MS) {
+      authSessions.delete(id);
+    } else if (sess.status === 'verified' && now - sess.verifiedAt > AUTH_VERIFIED_TTL_MS) {
+      authSessions.delete(id);
+    }
+  }
+}, 60_000).unref();
+
+function createAuthSession() {
+  const id = crypto.randomBytes(16).toString('hex');
+  const secret = crypto.randomBytes(24).toString('hex');
+  const sess = {
+    secret,
+    status: 'pending',
+    createdAt: Date.now(),
+    verifiedAt: null,
+    email: null,
+    userId: null,
+    accessToken: null,
+    refreshToken: null,
+  };
+  authSessions.set(id, sess);
+  return { id, secret };
+}
+
+// Cache of { accessToken -> {user, validatedAt} } with a 60s TTL so each
+// /deploy doesn't roundtrip to Supabase for the same token.
+const jwtValidationCache = new Map();
+const JWT_CACHE_TTL_MS = 60_000;
+
+async function validateSupabaseAccessToken(accessToken) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('backend misconfigured: SUPABASE_URL / SUPABASE_ANON_KEY not set');
+  }
+  // Cache check
+  const cached = jwtValidationCache.get(accessToken);
+  if (cached && Date.now() - cached.validatedAt < JWT_CACHE_TTL_MS) {
+    return cached.user;
+  }
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'apikey': SUPABASE_ANON_KEY,
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (res.status === 401) {
+    const err = new Error('invalid or expired access token');
+    err.status = 401;
+    throw err;
+  }
+  if (!res.ok) {
+    throw new Error(`Supabase /auth/v1/user returned ${res.status}`);
+  }
+  const user = await res.json();
+  if (!user?.id || !user?.email) {
+    throw new Error('Supabase user response missing id/email');
+  }
+  const minimal = { id: user.id, email: user.email, emailConfirmed: !!user.email_confirmed_at };
+  jwtValidationCache.set(accessToken, { user: minimal, validatedAt: Date.now() });
+  // Bound the cache
+  if (jwtValidationCache.size > 500) {
+    const oldest = [...jwtValidationCache.entries()].sort((a, b) => a[1].validatedAt - b[1].validatedAt)[0];
+    if (oldest) jwtValidationCache.delete(oldest[0]);
+  }
+  return minimal;
+}
+
+// Resolve the PUBLIC_BACKEND_URL for /auth/page links — either from env or
+// from the incoming request's Host header. Default protocol to https for
+// public hosts; http for localhost/LAN so local dev actually works.
+function publicBackendUrl(req) {
+  if (PUBLIC_BACKEND_URL) return PUBLIC_BACKEND_URL;
+  const host = (req.headers['host'] || '').toString();
+  if (!host) return '';
+  const xfp = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+  let proto = xfp;
+  if (!proto) {
+    // Default based on host: loopback/private → http, everything else → https.
+    if (/^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?$/i.test(host)) proto = 'http';
+    else proto = 'https';
+  }
+  return `${proto}://${host}`;
+}
+
 // ---------- rate limiter + daily deploy cap ----------
 //
 // Two layers:
@@ -685,9 +834,240 @@ setTimeout(() => {
   }, CLEANUP_INTERVAL_MIN * 60 * 1000).unref();
 }, 15_000).unref();
 
+// ---------- /auth/* routes ----------
+
+function htmlResponse(res, status, html) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(html),
+    'Cache-Control': 'no-store',
+  });
+  res.end(html);
+}
+
+// Minimal auth page — renders in the user's browser. Uses Supabase JS SDK
+// from the CDN. Shows an email input, sends a magic link, then after the
+// redirect back, hands the access token to the backend.
+function renderAuthPage({ sessionId, secret, backendUrl }) {
+  const safeSession = String(sessionId).replace(/[^a-f0-9]/gi, '');
+  const safeSecret = String(secret).replace(/[^a-f0-9]/gi, '');
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>claude-deploy · sign in</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, ui-sans-serif, system-ui, sans-serif; max-width: 460px; margin: 4rem auto; padding: 0 1rem; color: #0f172a; line-height: 1.5; }
+  h1 { font-size: 1.75rem; margin: 0 0 .5rem; }
+  p { color: #475569; margin: .4rem 0 1rem; }
+  form { display: flex; gap: .5rem; margin-top: 1.25rem; }
+  input[type=email] { flex: 1; padding: .7rem .9rem; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 1rem; }
+  button { padding: .7rem 1.1rem; background: #0f172a; color: #fff; border: 0; border-radius: 8px; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  .hint { font-size: .85rem; color: #64748b; margin-top: .5rem; }
+  .status { margin-top: 1.25rem; padding: .9rem 1rem; border-radius: 10px; font-size: .95rem; display: none; }
+  .status.info { display: block; background: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe; }
+  .status.ok   { display: block; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+  .status.err  { display: block; background: #fef2f2; color: #7f1d1d; border: 1px solid #fecaca; }
+  code { background: #f1f5f9; padding: .1rem .35rem; border-radius: 4px; font-size: .9em; }
+  .foot { margin-top: 2rem; font-size: .8rem; color: #94a3b8; }
+</style>
+</head>
+<body>
+  <h1>claude-deploy</h1>
+  <p>Sign in with your email to deploy. You'll get a magic link — click it and you're back in the terminal.</p>
+
+  <form id="f">
+    <input id="email" type="email" required autocomplete="email" placeholder="you@example.com" />
+    <button id="go" type="submit">Send link</button>
+  </form>
+  <div class="hint">Session: <code id="sessionId"></code></div>
+  <div id="status" class="status"></div>
+
+  <div class="foot">No password needed. We only store the access token your <code>/deploy</code> command needs.</div>
+
+<script type="module">
+  import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+  const sessionId  = ${JSON.stringify(safeSession)};
+  const sessionSecret = ${JSON.stringify(safeSecret)};
+  const backendUrl = ${JSON.stringify(backendUrl)};
+  const supabaseUrl = ${JSON.stringify(SUPABASE_URL)};
+  const supabaseAnon = ${JSON.stringify(SUPABASE_ANON_KEY)};
+
+  document.getElementById('sessionId').textContent = sessionId.slice(0, 8) + '…';
+
+  const sb = createClient(supabaseUrl, supabaseAnon, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, flowType: 'pkce' },
+  });
+
+  const statusEl = document.getElementById('status');
+  function setStatus(kind, msg) { statusEl.className = 'status ' + kind; statusEl.textContent = msg; }
+
+  async function completeWithSession(sess) {
+    if (!sess || !sess.access_token) { setStatus('err', 'No access token returned.'); return; }
+    setStatus('info', 'Verifying with claude-deploy backend…');
+    const r = await fetch(backendUrl + '/auth/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sessionId,
+        secret: sessionSecret,
+        access_token: sess.access_token,
+        refresh_token: sess.refresh_token || null,
+      }),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      setStatus('err', 'Backend rejected session: ' + body.slice(0, 200));
+      return;
+    }
+    setStatus('ok', '✅ Signed in! You can close this tab and return to your terminal.');
+  }
+
+  // Case 1: we're redirected back from the magic link. Supabase puts the
+  // tokens in the URL hash. Exchange the hash and push back to backend.
+  if (location.hash.includes('access_token=')) {
+    const params = new URLSearchParams(location.hash.slice(1));
+    const sess = {
+      access_token: params.get('access_token'),
+      refresh_token: params.get('refresh_token'),
+    };
+    completeWithSession(sess).catch(e => setStatus('err', 'Error: ' + e.message));
+  }
+
+  // Case 2: fresh page load — show the form.
+  document.getElementById('f').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const email = document.getElementById('email').value.trim();
+    if (!email) return;
+    const btn = document.getElementById('go');
+    btn.disabled = true;
+    setStatus('info', 'Sending magic link to ' + email + '…');
+    try {
+      const redirectTo = backendUrl + '/auth/page?session_id=' + encodeURIComponent(sessionId) + '&secret=' + encodeURIComponent(sessionSecret);
+      const { error } = await sb.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: redirectTo, shouldCreateUser: true },
+      });
+      if (error) throw error;
+      setStatus('ok', '📬 Check your inbox at ' + email + ' and click the link. This tab will update automatically.');
+    } catch (e) {
+      setStatus('err', 'Failed to send link: ' + (e.message || e));
+      btn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>`;
+}
+
+async function handleAuthRoute(req, res, pathname, url, qs) {
+  const backendUrl = publicBackendUrl(req);
+
+  // POST /auth/start — create a session, return session_id + verify_url
+  if (req.method === 'POST' && pathname === '/auth/start') {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return jsonResponse(res, 500, { error: 'auth not configured on this backend' });
+    }
+    const { id, secret } = createAuthSession();
+    const verify_url = `${backendUrl}/auth/page?session_id=${id}&secret=${secret}`;
+    return jsonResponse(res, 200, {
+      session_id: id,
+      secret,
+      verify_url,
+      poll_url: `${backendUrl}/auth/check?session_id=${id}&secret=${secret}`,
+      expires_in: Math.floor(AUTH_SESSION_TTL_MS / 1000),
+    });
+  }
+
+  // GET /auth/check — CLI polls this. Returns pending or verified + access_token.
+  if (req.method === 'GET' && pathname === '/auth/check') {
+    const sid = qs.get('session_id') || '';
+    const secret = qs.get('secret') || '';
+    const sess = authSessions.get(sid);
+    if (!sess) {
+      return jsonResponse(res, 404, { status: 'unknown', error: 'session not found or expired' });
+    }
+    if (sess.secret !== secret) {
+      return jsonResponse(res, 403, { status: 'forbidden', error: 'session secret mismatch' });
+    }
+    if (sess.status === 'pending') {
+      return jsonResponse(res, 200, { status: 'pending', expires_in: Math.max(0, Math.floor((sess.createdAt + AUTH_SESSION_TTL_MS - Date.now()) / 1000)) });
+    }
+    if (sess.status === 'verified') {
+      return jsonResponse(res, 200, {
+        status: 'verified',
+        access_token: sess.accessToken,
+        refresh_token: sess.refreshToken,
+        email: sess.email,
+        user_id: sess.userId,
+      });
+    }
+    return jsonResponse(res, 410, { status: sess.status });
+  }
+
+  // GET /auth/page?session_id=...&secret=... — render the sign-in UI.
+  // Also handles the magic-link redirect (tokens in URL hash, client-side JS
+  // picks them up and POSTs to /auth/complete).
+  if (req.method === 'GET' && pathname === '/auth/page') {
+    const sid = qs.get('session_id') || '';
+    const secret = qs.get('secret') || '';
+    const sess = authSessions.get(sid);
+    if (!sess || sess.secret !== secret) {
+      return htmlResponse(res, 404, `<!doctype html><html><body style="font-family:system-ui;max-width:460px;margin:4rem auto;padding:0 1rem"><h1>Session expired</h1><p>Please run <code>/deploy</code> again to start a new sign-in session.</p></body></html>`);
+    }
+    return htmlResponse(res, 200, renderAuthPage({ sessionId: sid, secret, backendUrl }));
+  }
+
+  // POST /auth/complete — receives the access_token from the browser page.
+  // Validates it against Supabase, then marks the session verified.
+  if (req.method === 'POST' && pathname === '/auth/complete') {
+    let body;
+    try {
+      const raw = await readBody(req, 16 * 1024);
+      body = JSON.parse(raw.toString('utf-8'));
+    } catch {
+      return jsonResponse(res, 400, { error: 'invalid JSON body' });
+    }
+    const { session_id, secret, access_token, refresh_token } = body || {};
+    if (!session_id || !secret || !access_token) {
+      return jsonResponse(res, 400, { error: 'missing session_id, secret, or access_token' });
+    }
+    const sess = authSessions.get(session_id);
+    if (!sess || sess.secret !== secret) {
+      return jsonResponse(res, 403, { error: 'session not found or secret mismatch' });
+    }
+    let user;
+    try {
+      user = await validateSupabaseAccessToken(access_token);
+    } catch (err) {
+      return jsonResponse(res, 401, { error: 'access token rejected by Supabase', detail: (err.message || '').slice(0, 200) });
+    }
+    if (!user.emailConfirmed) {
+      return jsonResponse(res, 403, {
+        error: 'email not verified',
+        detail: 'Click the confirmation link in your inbox, then retry.',
+      });
+    }
+    sess.status = 'verified';
+    sess.verifiedAt = Date.now();
+    sess.email = user.email;
+    sess.userId = user.id;
+    sess.accessToken = access_token;
+    sess.refreshToken = refresh_token || null;
+    console.log(`[claude-deploy] auth verified session=${session_id.slice(0, 8)}… user=${user.email}`);
+    return jsonResponse(res, 200, { ok: true, user: { id: user.id, email: user.email } });
+  }
+
+  return jsonResponse(res, 404, { error: 'not found' });
+}
+
 // ---------- HTTP server ----------
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const MAINTENANCE_MODE = process.env.CD_MAINTENANCE === '1' || process.env.CD_MAINTENANCE === 'true';
 
 const server = http.createServer(async (req, res) => {
@@ -695,25 +1075,43 @@ const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const log = (msg) => console.log(`[claude-deploy] ${req.method} ${req.url} ip=${ip} ${msg}`);
 
+  // Parse URL + search params once
+  let url;
   try {
-    if (req.method === 'GET' && req.url === '/health') {
+    url = new URL(req.url || '/', publicBackendUrl(req) || `http://${req.headers.host || 'localhost'}`);
+  } catch {
+    return jsonResponse(res, 400, { error: 'bad request url' });
+  }
+  const pathname = url.pathname;
+  const qs = url.searchParams;
+
+  try {
+    // ----- basic/status -----
+    if (req.method === 'GET' && pathname === '/health') {
       return jsonResponse(res, 200, { ok: true, version: VERSION });
     }
-    if (req.method === 'GET' && req.url === '/') {
+    if (req.method === 'GET' && pathname === '/') {
       const daily = dailyCount(ip);
       return jsonResponse(res, 200, {
         service: 'claude-deploy',
         version: VERSION,
-        endpoints: ['POST /deploy', 'GET /health'],
+        endpoints: ['POST /deploy', 'POST /auth/start', 'GET /auth/check', 'GET /auth/page', 'GET /auth/callback', 'POST /auth/complete', 'GET /health'],
         maintenance: MAINTENANCE_MODE,
         ttl_hours: SERVICE_TTL_HOURS,
-        daily_limit_per_ip: DAILY_LIMIT_PER_IP,
+        daily_limit_per_user: DAILY_LIMIT_PER_IP, // label change for clarity; env var stays
         daily_limit_global: DAILY_LIMIT_GLOBAL,
         daily_used_your_ip: daily.perIp,
         daily_used_global: daily.global,
+        auth: SUPABASE_URL ? 'supabase' : 'unconfigured',
       });
     }
-    if (!(req.method === 'POST' && req.url === '/deploy')) {
+
+    // ----- auth flow -----
+    if (pathname.startsWith('/auth/')) {
+      return await handleAuthRoute(req, res, pathname, url, qs);
+    }
+
+    if (!(req.method === 'POST' && pathname === '/deploy')) {
       return jsonResponse(res, 404, { error: 'not found' });
     }
 
@@ -725,9 +1123,37 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (!checkAuth(req)) {
+    // Authenticate the caller. With Supabase configured we REQUIRE a valid
+    // access token in Authorization: Bearer <token>. Without Supabase
+    // configured, fall back to the shared CLIENT_TOKEN gate (backwards
+    // compat for local development).
+    let authUser = null;
+    if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+      const accessToken = extractBearerToken(req);
+      if (!accessToken) {
+        return jsonResponse(res, 401, {
+          error: 'authentication required',
+          detail: 'Run /deploy and complete the email sign-in flow. Your session token will be cached locally.',
+        });
+      }
+      try {
+        authUser = await validateSupabaseAccessToken(accessToken);
+      } catch (err) {
+        return jsonResponse(res, 401, {
+          error: 'invalid or expired session',
+          detail: 'Your session token was rejected. Run /deploy again to sign in.',
+        });
+      }
+      if (!authUser.emailConfirmed) {
+        return jsonResponse(res, 403, {
+          error: 'email not verified',
+          detail: 'Check your inbox for the verification link we sent and click it, then run /deploy again.',
+        });
+      }
+    } else if (!checkAuth(req)) {
       return jsonResponse(res, 401, { error: 'unauthorized' });
     }
+
     if (rateLimited(ip)) {
       return jsonResponse(res, 429, { error: 'rate limit exceeded (per-minute burst limit)' });
     }
@@ -738,23 +1164,29 @@ const server = http.createServer(async (req, res) => {
     }
 
     const projectNameHeader = (req.headers['x-project-name'] || 'app').toString();
-    const clientIdHeader = (req.headers['x-claude-deploy-client'] || '').toString();
     const projectSlugHeader = (req.headers['x-project-slug'] || '').toString();
-    const canUpsert = Boolean(clientIdHeader && projectSlugHeader);
+    // Authenticated user_id takes precedence over X-Claude-Deploy-Client for
+    // the upsert key. This makes deploys portable across machines (same
+    // account = same URL) and makes per-user quotas meaningful.
+    const clientIdHeader = (req.headers['x-claude-deploy-client'] || '').toString();
+    const upsertIdentity = authUser ? `u:${authUser.id}` : (clientIdHeader ? `c:${clientIdHeader}` : '');
+    const canUpsert = Boolean(upsertIdentity && projectSlugHeader);
+
+    // Daily cap bucket key: per-user when authenticated, per-IP otherwise.
+    const bucketKey = authUser ? `u:${authUser.id}` : ip;
 
     // If this request is going to create a NEW service, check the daily cap
-    // BEFORE we accept the body. Upsert requests that reuse an existing
-    // service always pass this check — their cost is already booked.
+    // BEFORE we accept the body. Upsert requests always pass.
     if (!canUpsert) {
-      const reason = dailyWouldExceed(ip);
+      const reason = dailyWouldExceed(bucketKey);
       if (reason) {
         const retry = retryAfterSecondsUntilNextWindow();
-        const which = reason === 'global' ? 'global daily cap' : 'your IP daily cap';
-        console.warn(`[claude-deploy] daily cap hit ip=${ip} reason=${reason} count=${JSON.stringify(dailyCount(ip))}`);
+        const which = reason === 'global' ? 'global daily cap' : (authUser ? 'your account daily cap' : 'your IP daily cap');
+        console.warn(`[claude-deploy] daily cap hit key=${bucketKey} reason=${reason}`);
         res.setHeader('Retry-After', String(retry));
         return jsonResponse(res, 429, {
           error: `${which} reached — try again in ${Math.ceil(retry / 3600)}h, or self-host the backend (see README)`,
-          limit_per_ip: DAILY_LIMIT_PER_IP,
+          limit_per_user: DAILY_LIMIT_PER_IP,
           limit_global: DAILY_LIMIT_GLOBAL,
           retry_after_s: retry,
         });
@@ -770,18 +1202,18 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, 400, { error: 'body is not a gzip stream' });
     }
 
-    log(`bytes=${body.length} project=${projectNameHeader} upsert=${canUpsert}`);
+    log(`bytes=${body.length} project=${projectNameHeader} user=${authUser?.email || '(anon)'} upsert=${canUpsert}`);
 
     const result = await deploy(body, {
       projectNameHint: projectNameHeader,
-      clientId: clientIdHeader || null,
+      clientId: upsertIdentity || null,
       projectSlug: projectSlugHeader || null,
     });
 
     // Only count new service creations against the daily cap. Redeploys to
     // an existing service are free.
     if (result.isNewService) {
-      dailyBumpCreate(ip);
+      dailyBumpCreate(bucketKey);
     }
 
     const elapsedMs = Date.now() - started;
@@ -793,12 +1225,12 @@ const server = http.createServer(async (req, res) => {
     });
   } catch (err) {
     console.error(`[claude-deploy] error:`, err);
-    // Translate persistent Railway platform failures into a clean 503 so
-    // clients show "Railway appears to be down, try again" instead of a
+    // Translate persistent upstream platform failures into a clean 503 so
+    // clients show "hosting is temporarily down, try again" instead of a
     // scary 500 with internals.
     if (isTransientRailwayError(err)) {
       return jsonResponse(res, 503, {
-        error: 'Railway platform is temporarily unavailable. Please try /deploy again in a minute.',
+        error: 'Hosting platform is temporarily unavailable. Please try /deploy again in a minute.',
         detail: (err.message || '').slice(0, 300),
       });
     }
